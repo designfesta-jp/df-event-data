@@ -1,0 +1,48 @@
+name: イベントのデータを配信
+
+on:
+  schedule:
+    - cron: '12,42 * * * *'   # 30分ごと。毎時0・30分は混んで遅れやすいのでずらしてある
+  workflow_dispatch:          # Actions の画面の「Run workflow」で今すぐ実行（変更がなくても配信する）
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      # Pages は配信のたびにサイト全体を置き換えるので、フード・タイムテーブルなどを足すときも、
+      # 別のワークフローにせず、この site フォルダーに一緒に書き出す
+      - id: convert
+        name: ワークショップ一覧をスプレッドシートから取得して変換
+        env:
+          WS_CSV_URL: ${{ secrets.WS_CSV_URL }}
+          PAGES_URL: https://designfesta-jp.github.io/df-event-data/
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: node scripts/workshop.mjs site
+      # 前回から変わっていなければ配信しない（手動実行のときは必ず配信する）
+      - if: steps.convert.outputs.changed == 'true'
+        uses: actions/configure-pages@v5
+      - if: steps.convert.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        if: steps.convert.outputs.changed == 'true'
+        uses: actions/deploy-pages@v4
