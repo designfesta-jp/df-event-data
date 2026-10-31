@@ -1,9 +1,10 @@
 // スプレッドシートの公開用タブ（ウェブに公開したCSV）を取得し、イベントのページが読む JSON と、
-// 小さくした写真（photos/）を出力先フォルダーに書く。今はワークショップ一覧（workshop.json）とフード店舗一覧（food.json）。
+// 小さくした写真（photos/）を出力先フォルダーに書く。今はワークショップ一覧（workshop.json）・フード店舗一覧（food.json）・
+// ショーステージとパフォーマンスのタイムテーブル（timetable.json）。
 //
 // 使い方: node scripts/build.mjs <出力先フォルダー>
-//   環境変数 WS_CSV_URL・FOOD_CSV_URL   … 公開CSVのURL（GitHub の Secret）
-//            WS_CSV_FILE・FOOD_CSV_FILE … URLの代わりに手元のCSVファイルを読む（テスト用。手元ではどちらもなければその一覧は飛ばす）
+//   環境変数 WS_CSV_URL・FOOD_CSV_URL・TT_CSV_URL    … 公開CSVのURL（GitHub の Secret）
+//            WS_CSV_FILE・FOOD_CSV_FILE・TT_CSV_FILE … URLの代わりに手元のCSVファイルを読む（テスト用。手元ではどちらもなければその一覧は飛ばす）
 //            PAGES_URL   … 配信中のデータの置き場所（前回との比較と、作り済みの写真の使い回しに使う）
 //            FORCE       … 'true' なら、CSVが前回と同じでも作り直す（手動実行）
 // Pages は配信のたびにサイト全体を置き換えるので、どれか1つでも変わっていれば全部の一覧を書き出す。
@@ -19,7 +20,8 @@ const outDir = process.argv[2];
 if (!outDir) fail('出力先フォルダーを指定してください');
 
 // 公開用タブの見出し（web-design の event/*/spreadsheet.md の数式と同じ）。見出しは完全一致（全角/半角・空白の違いは無視）
-// text は JSON にそのまま入れる項目（空なら入れない）。ブース番号・出展名・リンク・写真はどの一覧も同じ扱い
+// text は JSON にそのまま入れる項目（空なら入れない）。リンク・写真はどの一覧も同じ扱い。
+// ワークショップ・フードはブース番号の1行が1件、タイムテーブル（slots）はステージ・日付・開始時刻の1行が1枠
 const COMMON = {
   booth: 'ブース番号', name: '出展名', en: '出展名（英語）', day: '出展日', desc: '説明',
   about: '私たちについて', content: '出展内容について', hp: 'HPアドレス', sns1: 'SNS1(URL)', sns2: 'SNS2(URL)',
@@ -36,7 +38,17 @@ const DATASETS = [
     fields: { ...COMMON, kind: '料理', kind_en: '料理（英語）', allergy: 'アレルギー' },
     text: ['en', 'day', 'kind', 'kind_en', 'allergy', 'desc', 'about', 'content'],
   },
+  {
+    key: 'timetable', title: 'タイムテーブル', tab: 'TT公開用', urlEnv: 'TT_CSV_URL', fileEnv: 'TT_CSV_FILE', slots: true,
+    fields: {
+      stage: 'ステージ', date: '日付', start: '開始', min: '出演時間（分）', name: '出演名', en: '出演名（英語）',
+      genre: 'ジャンル', genre_en: 'ジャンル（英語）', photo: '写真', desc: '紹介文', hp: 'HPアドレス', sns1: 'SNS1(URL)', sns2: 'SNS2(URL)',
+    },
+    text: ['en', 'genre', 'genre_en', 'desc'],
+  },
 ];
+// タイムテーブルのステージ（ステージの列の文字に含まれる語 → ページの stage）
+const STAGES = [['ショー', 'show'], ['パフォーマンス', 'perf']];
 const MIN_RATIO = 0.5;          // 前回の件数からこれ未満の割合に減ったら、シートの事故とみなして配信しない
 const PHOTO_MAX = 960;          // 写真の長い辺（px）。一覧は2〜4列、詳細はスマホの幅いっぱい
 const PHOTO_QUALITY = 78;
@@ -60,7 +72,7 @@ if (!sets.some(s => s.changed) && !force) {
 for (const s of sets) {
   const { ds } = s;
   Object.assign(s, parseCSV(s.csvText, ds));
-  if (!s.items.length) fail(`${ds.title}：ブース番号の入った行が1件もありません`);
+  if (!s.items.length) fail(`${ds.title}：${ds.slots ? '出演名' : 'ブース番号'}の入った行が1件もありません`);
   s.prevCount = s.prev && Array.isArray(s.prev.items) ? s.prev.items.length : 0;
   if (s.prevCount && s.items.length < s.prevCount * MIN_RATIO) {
     fail(`${ds.title}の件数が前回の ${s.prevCount} 件から ${s.items.length} 件に減りました（${MIN_RATIO * 100}% 未満）。${ds.tab}タブを確認してください`);
@@ -82,7 +94,7 @@ for (const s of sets) {
       await writeFile(join(outDir, file), jpg);
       it.photoOk.set(src, file);
     } catch (e) {
-      photoStats.failed.push(`${it.label}（${e.message}）`);
+      photoStats.failed.push(`${it.label || it.name}（${e.message}）`);
     }
   });
   for (const it of items) {
@@ -229,7 +241,7 @@ function parseCSV(text, ds) {
   const items = [];
   let rejectedUrls = 0;
   for (const row of all.slice(1)) {
-    const boothStr = get(row, 'booth');
+    const boothStr = get(row, ds.slots ? 'name' : 'booth');
     if (!boothStr) continue;
     // スプレッドシートのエラー（見出しの打ち間違いなど）がそのまま公開されないよう止める
     const err = Object.keys(idx).find(k => /^#(N\/A|REF!|VALUE!|NAME\?|ERROR!|DIV\/0!)/.test(get(row, k)));
@@ -240,6 +252,7 @@ function parseCSV(text, ds) {
       if (v && !isSafeUrl(v)) { rejectedUrls++; return ''; }
       return v;
     };
+    if (ds.slots) { items.push(slotItem(ds, row, get, url)); continue; }
     const booths = boothStr.split(',').map(normBoothId).filter(Boolean);
     // 表示用：「D-10,D-11」→「D-10・11」（同じ列記号が続くとき）
     const label = booths.map((b, k) => k && b.split('-')[0] === booths[0].split('-')[0] ? b.split('-')[1] : b).join('・');
@@ -257,10 +270,46 @@ function parseCSV(text, ds) {
     it.photoOk = new Map();
     items.push(it);
   }
+  if (ds.slots) {
+    // ステージ・日・開始時刻の順。同じ枠が2行あれば、打ち間違いとみなして止める
+    const key = it => [it.stage, it.day, it.start].join(' ');
+    items.sort((a, b) => key(a).localeCompare(key(b)));
+    const dup = items.find((it, i) => i && key(it) === key(items[i - 1]));
+    if (dup) fail(`${ds.title}：同じステージ・日・開始時刻の行が2つあります（${key(dup)}）。${ds.tab}タブを確認してください`);
+    return { items, rows: all.length - 1, rejectedUrls };
+  }
   // ブース番号の順（D-1, D-2 … D-10）。列記号、番号の順に並べる
   items.sort((a, b) => {
     const [la, na] = a.booths[0].split('-'), [lb, nb] = b.booths[0].split('-');
     return la === lb ? (+na || 0) - (+nb || 0) : la.localeCompare(lb);
   });
   return { items, rows: all.length - 1, rejectedUrls };
+}
+
+// タイムテーブルの1行（1枠）。ステージは show／perf、日付は曜日から sat／sun、開始は「10:10」の形にそろえる。
+// 読めない値は、ページで黙って消えないよう止める
+function slotItem(ds, row, get, url) {
+  const name = get(row, 'name'), where = `「${name}」の行`;
+  const stageStr = get(row, 'stage');
+  const stage = (STAGES.find(([w]) => stageStr.includes(w)) || [])[1];
+  if (!stage) fail(`${ds.title}：${where}のステージ「${stageStr}」がわかりません（${STAGES.map(s => s[0]).join('・')}を含む文字にしてください）`);
+  const dm = get(row, 'date').match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  const wd = dm && new Date(Date.UTC(+dm[1], +dm[2] - 1, +dm[3])).getUTCDay();
+  const day = wd === 6 ? 'sat' : wd === 0 ? 'sun' : null;
+  if (!day) fail(`${ds.title}：${where}の日付「${get(row, 'date')}」が土曜・日曜の日付（2026-11-14 の形）ではありません`);
+  const tm = get(row, 'start').match(/^(\d{1,2})[:：](\d{2})/);
+  if (!tm || +tm[1] > 23 || +tm[2] > 59) fail(`${ds.title}：${where}の開始「${get(row, 'start')}」が時刻（10:10 の形）ではありません`);
+  const it = { stage, day, start: tm[1].padStart(2, '0') + ':' + tm[2], name };
+  const min = parseInt(get(row, 'min'), 10);
+  if (min > 0) it.min = min;
+  for (const key of ds.text) {
+    const v = get(row, key);
+    if (v) it[key] = v;
+  }
+  const links = [];
+  for (const [key, type] of [['hp', 'hp'], ['sns1', 'sns'], ['sns2', 'sns']]) { const u = url(key); if (u) links.push({ type, url: u }); }
+  if (links.length) it.links = links;
+  it.photoSrc = [url('photo')].filter(Boolean);
+  it.photoOk = new Map();
+  return it;
 }
