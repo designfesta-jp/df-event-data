@@ -7,6 +7,8 @@
 //            WS_CSV_FILE・FOOD_CSV_FILE・TT_CSV_FILE … URLの代わりに手元のCSVファイルを読む（テスト用。手元ではどちらもなければその一覧は飛ばす）
 //            PAGES_URL   … 配信中のデータの置き場所（前回との比較と、作り済みの写真の使い回しに使う）
 //            FORCE       … 'true' なら、CSVが前回と同じでも作り直す（手動実行）
+// 写真の列（写真（差し替え）・写真）には URL のほか、WordPress のメディアライブラリに上げたファイル名（例 tt64-show-sat-01）も書ける。
+// 配信を作るときにメディアライブラリで探して URL にする（まだ上げていなければ、その写真なしで配信し、要約に出す）
 // Pages は配信のたびにサイト全体を置き換えるので、どれか1つでも変わっていれば全部の一覧を書き出す。
 // 見出しが足りない・件数が前回の半分未満になったなどの異常が1つでもあれば、何も書かずに失敗で終わる
 // （その場合は配信されず、前回のデータがそのまま残る）。
@@ -49,18 +51,39 @@ const DATASETS = [
 ];
 // タイムテーブルのステージ（ステージの列の文字に含まれる語 → ページの stage）
 const STAGES = [['ショー', 'show'], ['パフォーマンス', 'perf']];
+const MEDIA_API = 'https://designfesta.com/wp-json/wp/v2/media';   // ファイル名で写真を探す所（WordPress の REST API）
+const MEDIA_NAME = /^[A-Za-z0-9._ -]+$/;                            // ファイル名とみなす書き方（英数字・ハイフン・下線・点・空白）
 const MIN_RATIO = 0.5;          // 前回の件数からこれ未満の割合に減ったら、シートの事故とみなして配信しない
 const PHOTO_MAX = 960;          // 写真の長い辺（px）。一覧は2〜4列、詳細はスマホの幅いっぱい
 const PHOTO_QUALITY = 78;
 
 const force = process.env.FORCE === 'true' || !process.env.GITHUB_ACTIONS;
 const sets = [];
+// 先に全部の CSV を読んで確かめる（1つでも異常があれば、写真を作る前に止める）
 for (const ds of DATASETS) {
   const csvText = await loadCsv(ds);
   if (csvText == null) { await report([`## ${ds.title}`, `- ${ds.fileEnv}・${ds.urlEnv} がないので飛ばした（手元での実行）`]); continue; }
   const prev = await fetchJson(process.env.PAGES_URL && process.env.PAGES_URL + ds.key + '.json?t=' + Date.now());
-  const sourceHash = sha1(csvText);
-  sets.push({ ds, csvText, prev, sourceHash, changed: !prev || prev.sourceHash !== sourceHash });
+  sets.push({ ds, csvText, prev, ...parseCSV(csvText, ds) });
+}
+
+// 写真のファイル名を、メディアライブラリで探して URL にする。
+// ファイル名が URL に変わったとき（あとから上げたとき）も配信し直すよう、前回との比較には探した結果も含める
+const media = await findMedia([...new Set(sets.flatMap(s => s.items.flatMap(it => it.photoSrc)).filter(p => p.startsWith('media:')).map(p => p.slice(6)))]);
+for (const s of sets) {
+  const found = {};
+  s.missingMedia = [];
+  for (const it of s.items) {
+    it.photoSrc = [...new Set(it.photoSrc.map(p => {
+      if (!p.startsWith('media:')) return p;
+      const name = p.slice(6);
+      found[name] = media.get(name) || '';
+      if (!found[name]) s.missingMedia.push(`${it.label || it.name}（${name}）`);
+      return found[name];
+    }).filter(Boolean))];
+  }
+  s.sourceHash = sha1(s.csvText + (Object.keys(found).length ? JSON.stringify(found) : ''));
+  s.changed = !s.prev || s.prev.sourceHash !== s.sourceHash;
 }
 if (!sets.some(s => s.changed) && !force) {
   await report(sets.map(s => `- ${s.ds.title}: 前回からの変更なし`).concat('- 配信しない'));
@@ -68,10 +91,8 @@ if (!sets.some(s => s.changed) && !force) {
   process.exit(0);
 }
 
-// 先に全部の CSV を確かめる（1つでも異常があれば、写真を作る前に止める）
 for (const s of sets) {
   const { ds } = s;
-  Object.assign(s, parseCSV(s.csvText, ds));
   if (!s.items.length) fail(`${ds.title}：${ds.slots ? '出演名' : 'ブース番号'}の入った行が1件もありません`);
   s.prevCount = s.prev && Array.isArray(s.prev.items) ? s.prev.items.length : 0;
   if (s.prevCount && s.items.length < s.prevCount * MIN_RATIO) {
@@ -110,6 +131,7 @@ for (const s of sets) {
     `- 前回からの変更: ${s.changed ? 'あり' : 'なし'}`,
     `- http(s) 以外で外したURL: ${s.rejectedUrls} 件`,
     `- 写真: 新しく作った ${photoStats.made} 枚・前回のものを使った ${photoStats.reused} 枚・失敗 ${photoStats.failed.length} 枚${photoStats.failed.length ? '（' + photoStats.failed.join('、') + '）' : ''}`,
+    ...(s.missingMedia.length ? [`- 写真のファイル名がメディアライブラリに見つからない: ${s.missingMedia.length} 件（${s.missingMedia.join('、')}）`] : []),
   ]);
 }
 await writeFile(join(outDir, 'robots.txt'), 'User-agent: *\nDisallow: /\n');
@@ -146,6 +168,31 @@ async function loadCsv(ds) {
   // 公開をやめた・URLが違うときは Google のHTMLページが返る
   if (!type.includes('text/csv')) fail(`${ds.title}の公開CSVの代わりに ${type} が返りました。「ウェブに公開」の設定を確認してください`);
   return res.text();
+}
+
+// メディアライブラリで、ファイル名から画像の URL を探す。見つからない名前は入らない。
+// slug はファイル名と限らない（画像の中のタイトルが「Screenshot」なら screenshot-4 などになる）ので、
+// 名前の頭（最初のハイフンまで。例 tt64-）で検索し、URL の末尾のファイル名（このサイトが付ける8桁の頭・-scaled・拡張子を除く）と比べる。
+// 同じ名前が2つ以上あれば新しい方（検索結果は新しい順）。検索そのものができないとき（サイトが落ちているなど）は、
+// 写真が消えたまま配信しないよう止める
+async function findMedia(names) {
+  const map = new Map();
+  for (const prefix of new Set(names.map(n => n.includes('-') ? n.slice(0, n.indexOf('-') + 1) : n))) {
+    for (let page = 1, pages = 1; page <= pages; page++) {
+      const res = await fetch(`${MEDIA_API}?per_page=100&page=${page}&_fields=source_url&search=${encodeURIComponent(prefix)}`, { signal: AbortSignal.timeout(30000) }).catch(e => ({ ok: false, status: e.message }));
+      if (!res.ok) fail(`メディアライブラリで写真のファイル名を探せませんでした（${res.status}）。時間をおいて手動で実行してください`);
+      pages = +res.headers.get('x-wp-totalpages') || 1;
+      for (const m of await res.json()) {
+        const name = mediaName(String(m.source_url || '').split('/').pop().replace(/^[0-9a-f]{8}-/, '').replace(/-scaled(?=\.\w+$)/, ''));
+        if (isSafeUrl(m.source_url) && !map.has(name)) map.set(name, m.source_url);
+      }
+    }
+  }
+  return map;
+}
+// ファイル名を比べる形に（拡張子なし・小文字・空白はハイフン。WordPress も空白をハイフンにして保存する）
+function mediaName(v) {
+  return v.trim().replace(/\.(jpe?g|png|gif|webp|heic|pdf)$/i, '').toLowerCase().replace(/\s+/g, '-');
 }
 
 async function fetchJson(url) {
@@ -252,13 +299,18 @@ function parseCSV(text, ds) {
       if (v && !isSafeUrl(v)) { rejectedUrls++; return ''; }
       return v;
     };
-    if (ds.slots) { items.push(slotItem(ds, row, get, url)); continue; }
+    // 写真の列は、URL でなく英数字のファイル名なら、メディアライブラリで探す印（media:ファイル名）にする
+    const photoRef = (key) => {
+      const v = get(row, key);
+      return v && !isSafeUrl(v) && MEDIA_NAME.test(v) ? 'media:' + mediaName(v) : url(key);
+    };
+    if (ds.slots) { items.push(slotItem(ds, row, get, url, photoRef)); continue; }
     const booths = boothStr.split(',').map(normBoothId).filter(Boolean);
     // 表示用：「D-10,D-11」→「D-10・11」（同じ列記号が続くとき）
     const label = booths.map((b, k) => k && b.split('-')[0] === booths[0].split('-')[0] ? b.split('-')[1] : b).join('・');
     const links = [];
     for (const [key, type] of [['hp', 'hp'], ['sns1', 'sns'], ['sns2', 'sns']]) { const u = url(key); if (u) links.push({ type, url: u }); }
-    const photoSrc = [...new Set([url('photo'), url('img1'), url('img2'), url('img3'), url('img4')].filter(Boolean))];
+    const photoSrc = [...new Set([photoRef('photo'), url('img1'), url('img2'), url('img3'), url('img4')].filter(Boolean))];
 
     const it = { booths, label, name: get(row, 'name') };
     for (const key of ds.text) {
@@ -288,7 +340,7 @@ function parseCSV(text, ds) {
 
 // タイムテーブルの1行（1枠）。ステージは show／perf、日付は曜日から sat／sun、開始は「10:10」の形にそろえる。
 // 読めない値は、ページで黙って消えないよう止める
-function slotItem(ds, row, get, url) {
+function slotItem(ds, row, get, url, photoRef) {
   const name = get(row, 'name'), where = `「${name}」の行`;
   const stageStr = get(row, 'stage');
   const stage = (STAGES.find(([w]) => stageStr.includes(w)) || [])[1];
@@ -309,7 +361,7 @@ function slotItem(ds, row, get, url) {
   const links = [];
   for (const [key, type] of [['hp', 'hp'], ['sns1', 'sns'], ['sns2', 'sns']]) { const u = url(key); if (u) links.push({ type, url: u }); }
   if (links.length) it.links = links;
-  it.photoSrc = [url('photo')].filter(Boolean);
+  it.photoSrc = [photoRef('photo')].filter(Boolean);
   it.photoOk = new Map();
   return it;
 }
