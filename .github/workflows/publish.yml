@@ -16,13 +16,14 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # ubuntu-latest は 2026-10-19 から Ubuntu 26 へ順に切り替わる。開催（11/14・15）の前後に動く環境が変わらないよう、24.04 に固定（開催後に latest へ戻してよい）
+    runs-on: ubuntu-24.04
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -40,11 +41,11 @@ jobs:
         run: node scripts/build.mjs site
       # どの一覧も前回から変わっていなければ配信しない（手動実行のときは必ず配信する）
       - if: steps.convert.outputs.changed == 'true'
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
       - if: steps.convert.outputs.changed == 'true'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site
       - id: deploy
         if: steps.convert.outputs.changed == 'true'
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
