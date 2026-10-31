@@ -30,13 +30,14 @@ jobs:
       # Pages は配信のたびにサイト全体を置き換えるので、フード・タイムテーブルなどを足すときも、
       # 別のワークフローにせず、この site フォルダーに一緒に書き出す
       - id: convert
-        name: ワークショップ一覧をスプレッドシートから取得して変換
+        name: ワークショップ・フードの一覧をスプレッドシートから取得して変換
         env:
           WS_CSV_URL: ${{ secrets.WS_CSV_URL }}
+          FOOD_CSV_URL: ${{ secrets.FOOD_CSV_URL }}
           PAGES_URL: https://designfesta-jp.github.io/df-event-data/
           FORCE: ${{ github.event_name == 'workflow_dispatch' }}
-        run: node scripts/workshop.mjs site
-      # 前回から変わっていなければ配信しない（手動実行のときは必ず配信する）
+        run: node scripts/build.mjs site
+      # どの一覧も前回から変わっていなければ配信しない（手動実行のときは必ず配信する）
       - if: steps.convert.outputs.changed == 'true'
         uses: actions/configure-pages@v5
       - if: steps.convert.outputs.changed == 'true'

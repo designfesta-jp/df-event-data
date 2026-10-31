@@ -1,12 +1,13 @@
-// スプレッドシートの「WS公開用」タブ（ウェブに公開したCSV）を取得し、ワークショップ一覧のページが読む
-// workshop.json と、小さくした写真（photos/）を出力先フォルダーに書く。
+// スプレッドシートの公開用タブ（ウェブに公開したCSV）を取得し、イベントのページが読む JSON と、
+// 小さくした写真（photos/）を出力先フォルダーに書く。今はワークショップ一覧（workshop.json）とフード店舗一覧（food.json）。
 //
-// 使い方: node scripts/workshop.mjs <出力先フォルダー>
-//   環境変数 WS_CSV_URL  … 公開CSVのURL（GitHub の Secret）
-//            WS_CSV_FILE … URLの代わりに手元のCSVファイルを読む（テスト用）
+// 使い方: node scripts/build.mjs <出力先フォルダー>
+//   環境変数 WS_CSV_URL・FOOD_CSV_URL   … 公開CSVのURL（GitHub の Secret）
+//            WS_CSV_FILE・FOOD_CSV_FILE … URLの代わりに手元のCSVファイルを読む（テスト用。手元ではどちらもなければその一覧は飛ばす）
 //            PAGES_URL   … 配信中のデータの置き場所（前回との比較と、作り済みの写真の使い回しに使う）
 //            FORCE       … 'true' なら、CSVが前回と同じでも作り直す（手動実行）
-// 見出しが足りない・件数が前回の半分未満になったなどの異常があれば、何も書かずに失敗で終わる
+// Pages は配信のたびにサイト全体を置き換えるので、どれか1つでも変わっていれば全部の一覧を書き出す。
+// 見出しが足りない・件数が前回の半分未満になったなどの異常が1つでもあれば、何も書かずに失敗で終わる
 // （その場合は配信されず、前回のデータがそのまま残る）。
 import { mkdir, readFile, writeFile, appendFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -17,67 +18,90 @@ import heicConvert from 'heic-convert';
 const outDir = process.argv[2];
 if (!outDir) fail('出力先フォルダーを指定してください');
 
-// WS公開用タブの見出し（spreadsheet.md の数式と同じ）。見出しは完全一致（全角/半角・空白の違いは無視）
-const FIELDS = {
-  booth: 'ブース番号', name: '出展名', en: '出展名（英語）', day: '出展日', genre: 'ジャンル', sub: 'サブジャンル',
-  dur: '所要時間', price: '料金', desc: '説明', about: '私たちについて', content: '出展内容について',
-  hp: 'HPアドレス', sns1: 'SNS1(URL)', sns2: 'SNS2(URL)',
+// 公開用タブの見出し（web-design の event/*/spreadsheet.md の数式と同じ）。見出しは完全一致（全角/半角・空白の違いは無視）
+// text は JSON にそのまま入れる項目（空なら入れない）。ブース番号・出展名・リンク・写真はどの一覧も同じ扱い
+const COMMON = {
+  booth: 'ブース番号', name: '出展名', en: '出展名（英語）', day: '出展日', desc: '説明',
+  about: '私たちについて', content: '出展内容について', hp: 'HPアドレス', sns1: 'SNS1(URL)', sns2: 'SNS2(URL)',
   photo: '写真（差し替え）', img1: '画像1リンク', img2: '画像2リンク', img3: '画像3リンク', img4: '画像4リンク',
 };
+const DATASETS = [
+  {
+    key: 'workshop', title: 'ワークショップ', tab: 'WS公開用', urlEnv: 'WS_CSV_URL', fileEnv: 'WS_CSV_FILE',
+    fields: { ...COMMON, genre: 'ジャンル', sub: 'サブジャンル', dur: '所要時間', price: '料金' },
+    text: ['en', 'day', 'genre', 'sub', 'dur', 'price', 'desc', 'about', 'content'],
+  },
+  {
+    key: 'food', title: 'フード', tab: 'FOOD公開用', urlEnv: 'FOOD_CSV_URL', fileEnv: 'FOOD_CSV_FILE',
+    fields: { ...COMMON, kind: '料理', kind_en: '料理（英語）', allergy: 'アレルギー' },
+    text: ['en', 'day', 'kind', 'kind_en', 'allergy', 'desc', 'about', 'content'],
+  },
+];
 const MIN_RATIO = 0.5;          // 前回の件数からこれ未満の割合に減ったら、シートの事故とみなして配信しない
 const PHOTO_MAX = 960;          // 写真の長い辺（px）。一覧は2〜4列、詳細はスマホの幅いっぱい
 const PHOTO_QUALITY = 78;
 
-const csvText = await loadCsv();
-const sourceHash = sha1(csvText);
-const prev = await fetchJson(process.env.PAGES_URL && process.env.PAGES_URL + 'workshop.json?t=' + Date.now());
 const force = process.env.FORCE === 'true' || !process.env.GITHUB_ACTIONS;
-const changed = !prev || prev.sourceHash !== sourceHash;
-if (!changed && !force) {
-  await report([`## ワークショップ`, `- 前回からの変更: なし（配信しない）`]);
+const sets = [];
+for (const ds of DATASETS) {
+  const csvText = await loadCsv(ds);
+  if (csvText == null) { await report([`## ${ds.title}`, `- ${ds.fileEnv}・${ds.urlEnv} がないので飛ばした（手元での実行）`]); continue; }
+  const prev = await fetchJson(process.env.PAGES_URL && process.env.PAGES_URL + ds.key + '.json?t=' + Date.now());
+  const sourceHash = sha1(csvText);
+  sets.push({ ds, csvText, prev, sourceHash, changed: !prev || prev.sourceHash !== sourceHash });
+}
+if (!sets.some(s => s.changed) && !force) {
+  await report(sets.map(s => `- ${s.ds.title}: 前回からの変更なし`).concat('- 配信しない'));
   await output('changed', 'false');
   process.exit(0);
 }
 
-const { items, rows, rejectedUrls } = parseCSV(csvText);
-if (!items.length) fail('ブース番号の入った行が1件もありません');
-const prevCount = prev && Array.isArray(prev.items) ? prev.items.length : 0;
-if (prevCount && items.length < prevCount * MIN_RATIO) {
-  fail(`ワークショップの件数が前回の ${prevCount} 件から ${items.length} 件に減りました（${MIN_RATIO * 100}% 未満）。シートを確認してください`);
+// 先に全部の CSV を確かめる（1つでも異常があれば、写真を作る前に止める）
+for (const s of sets) {
+  const { ds } = s;
+  Object.assign(s, parseCSV(s.csvText, ds));
+  if (!s.items.length) fail(`${ds.title}：ブース番号の入った行が1件もありません`);
+  s.prevCount = s.prev && Array.isArray(s.prev.items) ? s.prev.items.length : 0;
+  if (s.prevCount && s.items.length < s.prevCount * MIN_RATIO) {
+    fail(`${ds.title}の件数が前回の ${s.prevCount} 件から ${s.items.length} 件に減りました（${MIN_RATIO * 100}% 未満）。${ds.tab}タブを確認してください`);
+  }
 }
 
 // 写真：元の画像を取って小さな JPEG にする。前回の配信に同じ写真があれば、それを使い回す
 await mkdir(join(outDir, 'photos'), { recursive: true });
-const photoStats = { made: 0, reused: 0, failed: [] };
-await runLimited(items.flatMap(it => it.photoSrc.map(src => ({ it, src }))), 4, async ({ it, src }) => {
-  const file = 'photos/' + sha1(src).slice(0, 16) + '.jpg';
-  try {
-    let jpg = await fetchBuffer(process.env.PAGES_URL && process.env.PAGES_URL + file);
-    if (jpg) photoStats.reused++;
-    else { jpg = await makePhoto(src); photoStats.made++; }
-    await writeFile(join(outDir, file), jpg);
-    it.photoOk.set(src, file);
-  } catch (e) {
-    photoStats.failed.push(`${it.label}（${e.message}）`);
-  }
-});
-for (const it of items) {
-  it.photos = it.photoSrc.map(src => it.photoOk.get(src)).filter(Boolean);
-  delete it.photoSrc; delete it.photoOk;
-}
-
 const generatedAt = new Date().toISOString();
-await writeFile(join(outDir, 'workshop.json'), JSON.stringify({ generatedAt, sourceHash, count: items.length, items }));
-await writeFile(join(outDir, 'robots.txt'), 'User-agent: *\nDisallow: /\n');
+for (const s of sets) {
+  const { ds, items } = s;
+  const photoStats = { made: 0, reused: 0, failed: [] };
+  await runLimited(items.flatMap(it => it.photoSrc.map(src => ({ it, src }))), 4, async ({ it, src }) => {
+    const file = 'photos/' + sha1(src).slice(0, 16) + '.jpg';
+    try {
+      let jpg = await fetchBuffer(process.env.PAGES_URL && process.env.PAGES_URL + file);
+      if (jpg) photoStats.reused++;
+      else { jpg = await makePhoto(src); photoStats.made++; }
+      await writeFile(join(outDir, file), jpg);
+      it.photoOk.set(src, file);
+    } catch (e) {
+      photoStats.failed.push(`${it.label}（${e.message}）`);
+    }
+  });
+  for (const it of items) {
+    it.photos = it.photoSrc.map(src => it.photoOk.get(src)).filter(Boolean);
+    delete it.photoSrc; delete it.photoOk;
+  }
 
-await report([
-  `## ワークショップ`,
-  `- 行数（見出しを除く）: ${rows}`,
-  `- ワークショップ: ${items.length} 件（前回 ${prevCount || 'なし'}）`,
-  `- 前回からの変更: ${changed ? 'あり（配信する）' : 'なし（手動実行なので配信する）'}`,
-  `- http(s) 以外で外したURL: ${rejectedUrls} 件`,
-  `- 写真: 新しく作った ${photoStats.made} 枚・前回のものを使った ${photoStats.reused} 枚・失敗 ${photoStats.failed.length} 枚${photoStats.failed.length ? '（' + photoStats.failed.join('、') + '）' : ''}`,
-]);
+  await writeFile(join(outDir, ds.key + '.json'), JSON.stringify({ generatedAt, sourceHash: s.sourceHash, count: items.length, items }));
+  await report([
+    `## ${ds.title}`,
+    `- 行数（見出しを除く）: ${s.rows}`,
+    `- ${ds.title}: ${items.length} 件（前回 ${s.prevCount || 'なし'}）`,
+    `- 前回からの変更: ${s.changed ? 'あり' : 'なし'}`,
+    `- http(s) 以外で外したURL: ${s.rejectedUrls} 件`,
+    `- 写真: 新しく作った ${photoStats.made} 枚・前回のものを使った ${photoStats.reused} 枚・失敗 ${photoStats.failed.length} 枚${photoStats.failed.length ? '（' + photoStats.failed.join('、') + '）' : ''}`,
+  ]);
+}
+await writeFile(join(outDir, 'robots.txt'), 'User-agent: *\nDisallow: /\n');
+await report([`- 配信する（${sets.some(s => s.changed) ? '変更あり' : '変更なしだが手動実行'}）`]);
 await output('changed', 'true');
 
 // ---------------------------------------------------------------------------
@@ -97,15 +121,18 @@ function sha1(s) {
   return createHash('sha1').update(s).digest('hex');
 }
 
-async function loadCsv() {
-  if (process.env.WS_CSV_FILE) return readFile(process.env.WS_CSV_FILE, 'utf8');
-  const url = process.env.WS_CSV_URL;
-  if (!url) fail('WS_CSV_URL（公開CSVのURL）が設定されていません');
+async function loadCsv(ds) {
+  if (process.env[ds.fileEnv]) return readFile(process.env[ds.fileEnv], 'utf8');
+  const url = process.env[ds.urlEnv];
+  if (!url) {
+    if (!process.env.GITHUB_ACTIONS) return null;
+    fail(`${ds.urlEnv}（${ds.tab}タブの公開CSVのURL）が設定されていません`);
+  }
   const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) fail(`公開CSVを取得できませんでした（HTTP ${res.status}）`);
+  if (!res.ok) fail(`${ds.title}の公開CSVを取得できませんでした（HTTP ${res.status}）`);
   const type = res.headers.get('content-type') || '';
   // 公開をやめた・URLが違うときは Google のHTMLページが返る
-  if (!type.includes('text/csv')) fail(`公開CSVの代わりに ${type} が返りました。「ウェブに公開」の設定を確認してください`);
+  if (!type.includes('text/csv')) fail(`${ds.title}の公開CSVの代わりに ${type} が返りました。「ウェブに公開」の設定を確認してください`);
   return res.text();
 }
 
@@ -188,15 +215,15 @@ function parseCSVFull(text) {
   return rows;
 }
 
-function parseCSV(text) {
+function parseCSV(text, ds) {
   const all = parseCSVFull(text);
   const headers = (all[0] || []).map(normHeader);
   const idx = {}, missing = [];
-  for (const [key, name] of Object.entries(FIELDS)) {
+  for (const [key, name] of Object.entries(ds.fields)) {
     const i = headers.indexOf(normHeader(name));
     if (i === -1) missing.push(name); else idx[key] = i;
   }
-  if (missing.length) fail('見出しが見つかりません: ' + missing.join('、') + '\nCSVの見出し: ' + (all[0] || []).join(', ').slice(0, 500));
+  if (missing.length) fail(`${ds.title}：見出しが見つかりません: ` + missing.join('、') + '\nCSVの見出し: ' + (all[0] || []).join(', ').slice(0, 500));
   const get = (row, key) => (row[idx[key]] || '').trim();
 
   const items = [];
@@ -206,7 +233,7 @@ function parseCSV(text) {
     if (!boothStr) continue;
     // スプレッドシートのエラー（見出しの打ち間違いなど）がそのまま公開されないよう止める
     const err = Object.keys(idx).find(k => /^#(N\/A|REF!|VALUE!|NAME\?|ERROR!|DIV\/0!)/.test(get(row, k)));
-    if (err) fail(`${boothStr} の「${FIELDS[err]}」がスプレッドシートのエラー（${get(row, err)}）です。WS公開用タブを確認してください`);
+    if (err) fail(`${boothStr} の「${ds.fields[err]}」がスプレッドシートのエラー（${get(row, err)}）です。${ds.tab}タブを確認してください`);
 
     const url = (key) => {
       const v = get(row, key);
@@ -221,7 +248,7 @@ function parseCSV(text) {
     const photoSrc = [...new Set([url('photo'), url('img1'), url('img2'), url('img3'), url('img4')].filter(Boolean))];
 
     const it = { booths, label, name: get(row, 'name') };
-    for (const key of ['en', 'day', 'genre', 'sub', 'dur', 'price', 'desc', 'about', 'content']) {
+    for (const key of ds.text) {
       const v = get(row, key);
       if (v) it[key] = v;
     }
